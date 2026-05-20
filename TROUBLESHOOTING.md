@@ -335,3 +335,126 @@ If issues persist:
    - OS and version
    - Full error message
    - Steps to reproduce
+
+---
+
+## Turbopack / Next.js Bundler Issues
+
+### "Cannot import WASM" or "Unexpected token" with Turbopack
+
+**Symptom:** Running `next dev` (Turbopack, the default since Next.js 15) throws
+an error like:
+
+```
+Error: Cannot find module '@midnight-ntwrk/ledger-v8'
+./node_modules/@midnight-ntwrk/ledger-v8/midnight_ledger_wasm.js
+import * as wasm from "./midnight_ledger_wasm_bg.wasm"
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+SyntaxError: Unexpected token
+```
+
+or
+
+```
+⨯ Error [ModuleNotFoundError]: Cannot find module 'midnight_ledger_wasm_bg.wasm'
+```
+
+**Root cause:** The `@midnight-ntwrk` WASM packages (`ledger-v8`,
+`onchain-runtime-v3`, `zkir-v2`) are published with the `wasm-bindgen
+--target bundler` browser loader, which contains:
+
+```js
+import * as wasm from "./midnight_ledger_wasm_bg.wasm";
+```
+
+This is the [WebAssembly ESM Integration
+proposal](https://github.com/WebAssembly/esm-integration) — supported by
+webpack 5 via `experiments.asyncWebAssembly`, but **not yet supported by
+Turbopack** (tracked upstream at
+[vercel/next.js#65887](https://github.com/vercel/next.js/issues/65887)).
+
+---
+
+### Quick fix: use the webpack bundler temporarily
+
+Pass the `--webpack` flag to fall back to webpack while the Turbopack issue is
+resolved upstream:
+
+```bash
+next dev --webpack
+```
+
+If you use `withMidnightJs()` (see below) the webpack path is already configured
+for you — no additional flags or config are needed.
+
+---
+
+### Permanent fix: patch the WASM loaders for Turbopack
+
+Install the Next.js integration helper:
+
+```bash
+yarn add @midnight-ntwrk/midnight-js-nextjs
+# or
+npm install @midnight-ntwrk/midnight-js-nextjs
+```
+
+Wrap your `next.config.ts`:
+
+```ts
+// next.config.ts
+import { withMidnightJs } from '@midnight-ntwrk/midnight-js-nextjs';
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {
+  // your existing config
+};
+
+export default withMidnightJs(nextConfig);
+```
+
+Then run the WASM patch script once after every install:
+
+```bash
+node node_modules/@midnight-ntwrk/midnight-js-nextjs/scripts/patch-wasm-turbopack.mjs
+```
+
+Or add it as a `postinstall` hook so it runs automatically:
+
+```json
+{
+  "scripts": {
+    "postinstall": "midnight-patch-wasm"
+  }
+}
+```
+
+**What the patch does:** Each WASM package ships a Node.js loader
+(`midnight_*_wasm_fs.js`) that already has the correct import/snippet wiring
+for the WASM binary. The script copies that wiring into the browser loader but
+replaces `readFileSync` with `fetch(new URL('./pkg_bg.wasm', import.meta.url))` —
+a static-asset reference pattern that **both Turbopack and webpack 5 support**.
+
+**What does NOT change:** the `.wasm` binary itself, the JS type exports, or
+any calling code. The patch is idempotent — safe to re-run on every install.
+
+---
+
+### Why `withMidnightJs()` instead of manual config?
+
+`withMidnightJs()` adds two things:
+
+| Setting | Effect |
+|---|---|
+| `webpack.experiments.asyncWebAssembly` | Enables the WASM ESM experiment for the client bundle when using webpack. Already on by default in Next.js, but set explicitly as a safety net in case other webpack plugins reset `experiments`. |
+| `serverExternalPackages` | Prevents Next.js from bundling the WASM packages server-side. Their Node.js loader uses `readFileSync` with a runtime `__dirname` path — correct when Node.js loads the package natively, broken when a bundler inlines it. |
+
+---
+
+### Long-term fix (upstream)
+
+The definitive solution is to update the artifacts repo to publish the WASM
+packages with `wasm-pack --target web` output (an async `init()` function
+using `fetch + WebAssembly.instantiateStreaming`) instead of `--target bundler`
+(static ESM WASM import).  An issue has been filed with the Midnight Foundation
+artifacts team.  Until that ships, the patch script is the recommended approach.
